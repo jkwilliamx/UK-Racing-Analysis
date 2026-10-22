@@ -27,13 +27,21 @@ CSV_FIELDS = [
     "sire_id","dam_id","damsire_id","draw","last_run_days","headgear","owner",
     "jockey_id","trainer_id"
 ]
-# Only sourced ratings and recent form affect the primary within-race index. Contextual
-# factors are calculated and displayed separately until validated with historical results.
+# Transparent starting weights, not yet statistically calibrated. The score is a
+# within-race ranking index, NOT a probability. Missing factors are omitted and the
+# remaining weights are renormalised. Historical factors are sample-size shrunk.
 FACTOR_WEIGHTS = {
-    "speed_figure": 0.40,
-    "performance_rating": 0.35,
+    "speed_figure": 0.29,
+    "performance_rating": 0.24,
     "official_rating": 0.15,
-    "form_proxy": 0.10,
+    "form_proxy": 0.15,
+    "horse_history": 0.05,
+    "course_history": 0.025,
+    "distance_history": 0.025,
+    "going_history": 0.015,
+    "trainer_history": 0.02,
+    "jockey_history": 0.015,
+    "recency": 0.02,
 }
 
 def connect():
@@ -568,8 +576,48 @@ def data_completeness(r):
     present = sum(1 for f in fields if r.get(f) not in (None, ""))
     return round(100.0 * present / len(fields), 1)
 
-def enrich_race(runners):
-    """Calculate race-relative screening and descriptive context from available fields."""
+def _smoothed_rate_score(wins, runs, baseline, prior_strength):
+    """Convert a win rate to a cautious 0-100 score, shrinking small samples to baseline."""
+    try:
+        wins, runs = float(wins or 0), int(runs or 0)
+    except (TypeError, ValueError):
+        return None
+    if runs <= 0 or wins < 0 or wins > runs:
+        return None
+    smoothed_rate = (wins + baseline * prior_strength) / (runs + prior_strength)
+    return max(0.0, min(100.0, 50.0 + (smoothed_rate - baseline) * 250.0))
+
+
+def _horse_history_score(r):
+    runs = int(r.get("history_runs") or 0)
+    if runs < 2:
+        return None
+    win_score = _smoothed_rate_score(r.get("history_wins"), runs, 0.10, 8)
+    top3 = r.get("history_top3_rate_pct")
+    if top3 is None:
+        return win_score
+    top3_rate = max(0.0, min(1.0, float(top3) / 100.0))
+    top3_smoothed = (top3_rate * runs + 0.30 * 8) / (runs + 8)
+    top3_score = max(0.0, min(100.0, 50.0 + (top3_smoothed - 0.30) * 125.0))
+    return 0.65 * win_score + 0.35 * top3_score if win_score is not None else top3_score
+
+
+def _context_win_score(r, runs_key, wins_key, minimum_runs=2, prior_strength=8):
+    runs = int(r.get(runs_key) or 0)
+    if runs < minimum_runs:
+        return None
+    return _smoothed_rate_score(r.get(wins_key), runs, 0.10, prior_strength)
+
+
+def _connection_score(r, runs_key, wins_key, minimum_runs=20):
+    runs = int(r.get(runs_key) or 0)
+    if runs < minimum_runs:
+        return None
+    return _smoothed_rate_score(r.get(wins_key), runs, 0.10, 40)
+
+
+def enrich_race(runners, race=None):
+    """Score active runners using available ratings plus cautiously shrunk local history."""
     active = [dict(r) for r in runners if not r.get("non_runner")]
     fields = {
         "speed_figure": [as_float(r.get("speed_figure")) for r in active],
@@ -578,21 +626,12 @@ def enrich_race(runners):
         "form_proxy": [form_proxy(r.get("recent_form")) for r in active],
     }
     ranks = {key: percentile_ranks(vals) for key, vals in fields.items()}
-    # Lighter carried weight is shown as context, but is deliberately not scored as
-    # automatically better: the handicapper has already allocated weight partly by ability.
     weights = [as_float(r.get("weight_lbs")) for r in active]
     weight_ranks = percentile_ranks([-w if w is not None else None for w in weights])
     recencies = [recency_proxy(as_float(r.get("last_run_days"))) for r in active]
     recency_ranks = percentile_ranks(recencies)
     result = []
     for idx, r in enumerate(active):
-        present_weight = sum(FACTOR_WEIGHTS[k] for k in FACTOR_WEIGHTS if ranks[k][idx] is not None)
-        score = None
-        # Basic racecards often contain only official rating + form. Permit an indicative
-        # score at >=20% coverage, but label sparse scores clearly and never call them odds.
-        if present_weight >= 0.20:
-            score = sum(FACTOR_WEIGHTS[k] * ranks[k][idx] for k in FACTOR_WEIGHTS
-                        if ranks[k][idx] is not None) / present_weight
         item = dict(r)
         item["form_proxy"] = fields["form_proxy"][idx]
         item["speed_percentile"] = ranks["speed_figure"][idx]
@@ -604,12 +643,37 @@ def enrich_race(runners):
         item["recency_label"] = recency_label(as_float(r.get("last_run_days")))
         item["weight_context_percentile"] = weight_ranks[idx]
         item["data_completeness_pct"] = data_completeness(r)
+        context_values = {
+            "horse_history": _horse_history_score(item),
+            "course_history": _context_win_score(item, "course_runs", "course_wins"),
+            "distance_history": _context_win_score(item, "distance_runs", "distance_wins"),
+            "going_history": _context_win_score(item, "going_runs", "going_wins"),
+            "trainer_history": _connection_score(item, "trainer_history_runs", "trainer_history_wins"),
+            "jockey_history": _connection_score(item, "jockey_history_runs", "jockey_history_wins"),
+            "recency": recency_ranks[idx],
+        }
+        component_ranks = {
+            "speed_figure": ranks["speed_figure"][idx],
+            "performance_rating": ranks["performance_rating"][idx],
+            "official_rating": ranks["official_rating"][idx],
+            "form_proxy": ranks["form_proxy"][idx],
+            **context_values,
+        }
+        present_weight = sum(FACTOR_WEIGHTS[k] for k, value in component_ranks.items() if value is not None)
+        score = None
+        if present_weight >= 0.20:
+            score = sum(FACTOR_WEIGHTS[k] * value for k, value in component_ranks.items()
+                        if value is not None) / present_weight
+        item.update(context_values)
+        item["component_ranks"] = component_ranks
         item["coverage_pct"] = round(present_weight * 100, 1)
         item["screening_index"] = round(score, 1) if score is not None else None
-        item["confidence"] = ("Higher rating coverage" if present_weight >= 0.85 else
-                               "Partial rating coverage" if present_weight >= 0.50 else
-                               "Low coverage — indicative only" if present_weight >= 0.20 else
-                               "Insufficient rating data")
+        item["confidence"] = (
+            "Higher factor coverage" if present_weight >= 0.80 else
+            "Moderate factor coverage" if present_weight >= 0.55 else
+            "Low coverage — indicative only" if present_weight >= 0.20 else
+            "Insufficient scoring data"
+        )
         item["analysis_flags"] = analysis_flags(item)
         result.append(item)
     result.sort(key=lambda x: (x["screening_index"] is None, -(x["screening_index"] or 0), x["runner_name"].lower()))
@@ -700,7 +764,10 @@ def build_report(date, meeting_name):
     with connect() as con:
         meeting = get_meeting(con, date, meeting_name)
         races = get_races(con, meeting["id"])
-    races = [(dict(race), historical_context({**dict(race), "course": meeting["course"], "race_date": date}, enrich_race(runners))) for race, runners in races]
+    races = [
+        (dict(race), historical_context({**dict(race), "course": meeting["course"], "race_date": date}, runners))
+        for race, runners in races
+    ]
     wb = Workbook()
     ws = wb.active
     ws.title = "Meeting Summary"
@@ -716,7 +783,7 @@ def build_report(date, meeting_name):
     ws.append([])
     ws.append(["Time","Race","Type","Class","Distance (f)","Going","Surface","Active runners","Non-runners","Top screening score"])
     for race, runners in races:
-        enriched = enrich_race(runners)
+        enriched = enrich_race(runners, race)
         active = [r for r in runners if not r["non_runner"]]
         scored = [r["screening_index"] for r in enriched if r["screening_index"] is not None]
         ws.append([race["race_time"],race["race_name"],race["race_type"],race["race_class"],race["distance_f"],race["going"],race["surface"],
@@ -733,7 +800,7 @@ def build_report(date, meeting_name):
 
     runner_rows = []
     for race, runners in races:
-        enriched = enrich_race(runners)
+        enriched = enrich_race(runners, race)
         for r in enriched:
             runner_rows.append([
                 race["race_time"], race["race_name"], race["race_type"], race["race_class"], race["distance_f"], race["going"], race["surface"], race["field_size"],
@@ -743,7 +810,9 @@ def build_report(date, meeting_name):
                 r.get("headgear"), r.get("sire"), r.get("dam"), r.get("damsire"), r.get("owner"),
                 r.get("speed_percentile"), r.get("performance_percentile"), r.get("official_rating_percentile"), r.get("form_percentile"),
                 r.get("recency_proxy"), r.get("weight_context_percentile"), r.get("data_completeness_pct"),
-                r.get("coverage_pct"), r.get("screening_index"), r.get("screening_rank"), r.get("confidence"), r.get("analysis_flags"),
+                r.get("coverage_pct"), r.get("screening_index"), r.get("screening_rank"), r.get("confidence"),
+                r.get("horse_history"), r.get("course_history"), r.get("distance_history"), r.get("going_history"),
+                r.get("trainer_history"), r.get("jockey_history"), r.get("recency"), r.get("analysis_flags"),
                 r.get("history_runs"), r.get("history_wins"), r.get("history_win_rate_pct"), r.get("history_top3_rate_pct"),
                 r.get("course_runs"), r.get("course_wins"), r.get("distance_runs"), r.get("distance_wins"), r.get("going_runs"), r.get("going_wins"),
                 r.get("trainer_history_runs"), r.get("trainer_history_wins"), r.get("trainer_win_rate_pct"),
@@ -757,7 +826,8 @@ def build_report(date, meeting_name):
         "Official Rating","Speed Figure (sourced)","Performance Rating (sourced)","Recent Form","Days Since Last Run","Recency Profile",
         "Trainer","Jockey","Draw","Headgear","Sire","Dam","Damsire","Owner",
         "Speed Percentile","Performance Percentile","OR Percentile","Form Percentile","Recency Heuristic (not validated)",
-        "Weight Context Percentile (not scored)","Data Completeness (%)","Rating Coverage (%)","Screening Index","Screening Rank","Confidence","Analysis Flags",
+        "Weight Context Percentile (context only)","Data Completeness (%)","Factor Coverage (%)","Screening Index (not probability)","Screening Rank","Evidence Coverage",
+        "Horse History Score","Course History Score","Distance History Score","Going History Score","Trainer History Score","Jockey History Score","Recency Score","Analysis Flags",
         "Historical Runs Stored","Historical Wins","Historical Win Rate %","Historical Top-3 Rate %","Course Runs","Course Wins","Distance-Similar Runs","Distance-Similar Wins","Going-Family Runs","Going-Family Wins",
         "Trainer Runs Stored","Trainer Wins Stored","Trainer Win Rate % (local sample)","Jockey Runs Stored","Jockey Wins Stored","Jockey Win Rate % (local sample)",
         "Course Historical Races Stored","Course+Type+Distance Races Stored","Same-Named Race Editions Stored","Historical Sample Note",
@@ -787,20 +857,22 @@ def build_report(date, meeting_name):
     ], audit)
 
     method_rows = [
-        ["Purpose", "Within-race screening aid only; not a probability of winning, tip, or betting advice."],
-        ["Sourced speed figure", "40% weight when available; the free feed may leave it blank."],
-        ["Sourced performance rating", "35% weight when available; the free feed may leave it blank."],
-        ["Official rating", "15% weight when available; percentile-ranked among active runners."],
-        ["Recent-form proxy", "10% weight; transparent heuristic from recent finishing positions, not a validated form model."],
-        ["Missing data", "No imputation. Weights are renormalized over available rating factors."],
-        ["Coverage threshold", "An indicative score is shown from 20% rating-weight coverage; below that it is withheld."],
-        ["Confidence", "Low coverage means the score is especially fragile; do not treat ranks as probabilities."],
-        ["Recency heuristic", "Displayed separately from the main score; broad heuristic, not empirically validated."],
-        ["Weight context", "Relative carried-weight rank is displayed but not scored as lower weight is not automatically better."],
-        ["Pedigree", "Sire, dam and damsire are displayed when available; no unsupported suitability claim is inferred."],
-        ["Not inferred from racecard alone", "Course/distance/going record, stamina, pace, jumping, fitness and trainer/jockey strike rates require historical datasets."],
-        ["Speed modelling", "Do not estimate speed from racecard alone. Reliable time, distance, course and going data plus calibration are required."],
-        ["Validation", "Backtest with time-ordered historical data before relying on any ranking."],
+        ["Purpose", "Within-race screening index only; not a win probability or betting advice."],
+        ["Sourced speed figure", "29% nominal weight when available; percentile-ranked within this field."],
+        ["Sourced performance rating", "24% nominal weight when available; percentile-ranked within this field."],
+        ["Official rating", "15% nominal weight when available; percentile-ranked within this field."],
+        ["Recent-form proxy", "15% nominal weight; simple finishing-position heuristic, not yet calibrated."],
+        ["Horse history", "5% nominal weight; historical win/top-three record shrunk towards a baseline; needs at least two stored runs."],
+        ["Course/distance/going history", "Small nominal weights; uses stored wins/runs, requires at least two comparable runs and shrinks small samples."],
+        ["Trainer/jockey history", "Small nominal weights; uses local stored wins/runs only with at least 20 stored runs; shrunk towards baseline."],
+        ["Recency", "2% nominal weight; heuristic only and not empirically validated."],
+        ["Missing data", "No missing values are invented. Weights are renormalised over available components."],
+        ["Coverage threshold", "An indicative score is shown from 20% factor-weight coverage; below that it is withheld."],
+        ["Evidence coverage", "Share of scoring weight supported by available factors; not calibrated prediction confidence."],
+        ["Weight context", "Carried weight is shown but not automatically scored; lower weight is not automatically better."],
+        ["Pedigree", "Displayed when available; no unsupported stamina or going suitability is inferred."],
+        ["Important limitation", "Historical data is only the local archive and may be incomplete or biased towards horses already fetched."],
+        ["Validation", "Weights are provisional. Run a chronological backtest against past race results before treating ranks as predictive."],
         ["Data rights", "Confirm source licence covers storage, derived outputs, exports and any onward display."],
     ]
     add_table_sheet(wb, "Scoring Method", ["Item","Definition"], method_rows)
@@ -818,7 +890,10 @@ def export_json(date, meeting_name):
     with connect() as con:
         meeting = get_meeting(con, date, meeting_name)
         races = get_races(con, meeting["id"])
-    races = [(dict(race), historical_context({**dict(race), "course": meeting["course"], "race_date": date}, enrich_race(runners))) for race, runners in races]
+    races = [
+        (dict(race), historical_context({**dict(race), "course": meeting["course"], "race_date": date}, runners))
+        for race, runners in races
+    ]
     payload = {
         "schema_version": "1.0",
         "generated_at_utc": now_utc(),
@@ -830,7 +905,7 @@ def export_json(date, meeting_name):
         "races": []
     }
     for race, runners in races:
-        enriched = enrich_race(runners)
+        enriched = enrich_race(runners, race)
         payload["races"].append({
             "time": race["race_time"], "name": race["race_name"], "type": race["race_type"],
             "class": race["race_class"], "distance_f": race["distance_f"], "going": race["going"],
@@ -846,7 +921,13 @@ def export_json(date, meeting_name):
                 "non_runner": bool(r.get("non_runner")), "screening_index": r.get("screening_index"),
                 "screening_rank": r.get("screening_rank"), "rating_coverage_pct": r.get("coverage_pct"),
                 "data_completeness_pct": r.get("data_completeness_pct"), "recency_heuristic": r.get("recency_proxy"),
-                "weight_context_percentile": r.get("weight_context_percentile"), "analysis_flags": r.get("analysis_flags"),
+                "weight_context_percentile": r.get("weight_context_percentile"),
+                "factor_scores": {
+                    "horse_history": r.get("horse_history"), "course_history": r.get("course_history"),
+                    "distance_history": r.get("distance_history"), "going_history": r.get("going_history"),
+                    "trainer_history": r.get("trainer_history"), "jockey_history": r.get("jockey_history"),
+                    "recency": r.get("recency")
+                }, "analysis_flags": r.get("analysis_flags"),
                 "confidence": r.get("confidence"), "historical": {
                     "runs_stored": r.get("history_runs"), "wins_stored": r.get("history_wins"),
                     "win_rate_pct": r.get("history_win_rate_pct"), "top3_rate_pct": r.get("history_top3_rate_pct"),
