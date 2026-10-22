@@ -644,84 +644,143 @@ def _going_family(value):
     return text or "unknown"
 
 def historical_context(race, runners):
-    """Attach evidence-based context from locally stored result history; never invent missing data."""
+    """Attach archive-backed context without loading the entire historical archive into RAM.
+
+    SFF files identify horses by normalised name (not Racing API horse ID), so history
+    is matched by both the stored horse key and horse name. Only results strictly before
+    the target race date are considered.
+    """
     init_db()
-    with connect() as con:
-        hist_races = [dict(x) for x in con.execute("SELECT * FROM historical_races").fetchall()]
-        hist_runners = [dict(x) for x in con.execute("SELECT * FROM historical_runners").fetchall()]
     course_key = normalise_key(race.get("course") or "")
     race_type = normalise_key(race.get("race_type") or "")
     distance = as_float(race.get("distance_f"))
     going_family = _going_family(race.get("going"))
     race_name_key = normalise_key(race.get("race_name"))
     target_date = str(race.get("race_date") or race.get("date") or "9999")
-    # Prevent same-day and future results leaking into pre-race analysis.
-    hist_races = [hr for hr in hist_races if str(hr.get("race_date") or "9999") < target_date]
-    race_meta = {x["race_key"]: x for x in hist_races}
-    relevant_course_races = []
-    relevant_course_type_distance = []
-    relevant_course_type_distance_going = []
-    same_named_race = []
-    for hr in hist_races:
-        if normalise_key(hr.get("course")) != course_key: continue
-        relevant_course_races.append(hr)
-        same_type = not race_type or normalise_key(hr.get("race_type")) == race_type
-        d = as_float(hr.get("distance_f"))
-        same_distance = distance is None or d is None or abs(d-distance) <= 1.5
-        if same_type and same_distance:
-            relevant_course_type_distance.append(hr)
-            if _going_family(hr.get("going")) == going_family and going_family != "unknown":
-                relevant_course_type_distance_going.append(hr)
-        if race_name_key and normalise_key(hr.get("race_name")) == race_name_key and hr.get("race_date", "") < str(race.get("race_date") or "9999"):
-            same_named_race.append(hr)
-    # Course/race context, based only on results stored locally.
-    result_by_key = {}
-    for rr in hist_runners: result_by_key.setdefault(rr["race_key"], []).append(rr)
-    course_starters = [rr for hr in relevant_course_races for rr in result_by_key.get(hr["race_key"], [])]
-    context_starters = [rr for hr in relevant_course_type_distance for rr in result_by_key.get(hr["race_key"], [])]
-    for item in runners:
-        horse_name = item.get("runner_name") or item.get("horse_name") or ""
-        horse_id = item.get("horse_id")
-        horse_key = horse_id or normalise_key(horse_name)
-        horse_runs = [rr for rr in hist_runners if rr.get("horse_key") == horse_key or (not horse_id and normalise_key(rr.get("horse_name")) == normalise_key(horse_name))]
-        # Only use past runs for this runner; future or same-day results are excluded.
-        race_date = str(race.get("race_date") or race.get("date") or "9999")
-        horse_runs = [rr for rr in horse_runs if (result_by_key.get(rr["race_key"]) and
-                      (race_meta.get(rr["race_key"], {}).get("race_date", "9999") < race_date))]
-        horse_race_meta = [race_meta.get(rr["race_key"], {}) for rr in horse_runs]
-        wins = sum(1 for rr in horse_runs if rr.get("finishing_position") == 1)
-        top3 = sum(1 for rr in horse_runs if rr.get("finishing_position") is not None and rr["finishing_position"] <= 3)
-        course_runs = [rr for rr, meta in zip(horse_runs, horse_race_meta) if normalise_key(meta.get("course")) == course_key]
-        course_wins = sum(1 for rr in course_runs if rr.get("finishing_position") == 1)
-        distance_runs = [rr for rr, meta in zip(horse_runs, horse_race_meta) if distance is not None and as_float(meta.get("distance_f")) is not None and abs(as_float(meta.get("distance_f"))-distance) <= 1.5]
-        going_runs = [rr for rr, meta in zip(horse_runs, horse_race_meta) if _going_family(meta.get("going")) == going_family and going_family != "unknown"]
-        item["history_runs"] = len(horse_runs)
-        item["history_wins"] = wins
-        item["history_win_rate_pct"] = round(100*wins/len(horse_runs),1) if horse_runs else None
-        item["history_top3_rate_pct"] = round(100*top3/len(horse_runs),1) if horse_runs else None
-        item["course_runs"] = len(course_runs)
-        item["course_wins"] = course_wins
-        item["course_win_rate_pct"] = round(100*course_wins/len(course_runs),1) if course_runs else None
-        item["distance_runs"] = len(distance_runs)
-        item["distance_wins"] = sum(1 for rr in distance_runs if rr.get("finishing_position") == 1)
-        item["going_runs"] = len(going_runs)
-        item["going_wins"] = sum(1 for rr in going_runs if rr.get("finishing_position") == 1)
-        item["history_sample_note"] = "Local archive only; grows as results are synced" if horse_runs else "No prior results stored locally"
-        trainer = normalise_key(item.get("trainer"))
-        jockey = normalise_key(item.get("jockey"))
-        trainer_runs = [rr for rr in hist_runners if trainer and normalise_key(rr.get("trainer")) == trainer and rr.get("race_key") in race_meta and race_meta[rr["race_key"]].get("race_date", "9999") < race_date]
-        jockey_runs = [rr for rr in hist_runners if jockey and normalise_key(rr.get("jockey")) == jockey and rr.get("race_key") in race_meta and race_meta[rr["race_key"]].get("race_date", "9999") < race_date]
-        item["trainer_history_runs"] = len(trainer_runs)
-        item["trainer_history_wins"] = sum(1 for rr in trainer_runs if rr.get("finishing_position") == 1)
-        item["trainer_win_rate_pct"] = round(100*item["trainer_history_wins"]/len(trainer_runs),1) if trainer_runs else None
-        item["jockey_history_runs"] = len(jockey_runs)
-        item["jockey_history_wins"] = sum(1 for rr in jockey_runs if rr.get("finishing_position") == 1)
-        item["jockey_win_rate_pct"] = round(100*item["jockey_history_wins"]/len(jockey_runs),1) if jockey_runs else None
-        item["course_race_history_count"] = len(relevant_course_races)
-        item["course_type_distance_races"] = len(relevant_course_type_distance)
-        item["course_type_distance_going_races"] = len(relevant_course_type_distance_going)
-        item["named_race_history_count"] = len(same_named_race)
-        item["course_context_winner_rate_pct"] = round(100*sum(1 for rr in context_starters if rr.get("finishing_position")==1)/len(context_starters),1) if context_starters else None
+
+    def row_dict(row):
+        return dict(row) if row is not None else {}
+
+    def aggregate_runners_for_keys(con, keys):
+        total_runs = total_wins = 0
+        # Stay below SQLite's variable limit and keep queries small on hosted Postgres too.
+        for offset in range(0, len(keys), 500):
+            batch = keys[offset:offset + 500]
+            if not batch:
+                continue
+            placeholders = ",".join("?" for _ in batch)
+            row = row_dict(con.execute(
+                f"SELECT COUNT(*) AS runs, SUM(CASE WHEN finishing_position=1 THEN 1 ELSE 0 END) AS wins "
+                f"FROM historical_runners WHERE race_key IN ({placeholders})", batch
+            ).fetchone())
+            total_runs += int(row.get("runs") or 0)
+            total_wins += int(row.get("wins") or 0)
+        return total_runs, total_wins
+
+    trainer_cache = {}
+    jockey_cache = {}
+    with connect() as con:
+        # Course-only slice; do not read 1.3m historical runner rows into Python.
+        course_rows = [row_dict(x) for x in con.execute(
+            "SELECT * FROM historical_races WHERE race_date < ? AND lower(trim(course)) = lower(trim(?))",
+            (target_date, str(race.get("course") or ""))
+        ).fetchall()]
+        # Normalised fallback handles punctuation differences in course labels.
+        if not course_rows and course_key:
+            candidates = [row_dict(x) for x in con.execute(
+                "SELECT * FROM historical_races WHERE race_date < ? AND lower(course) LIKE lower(?)",
+                (target_date, f"%{str(race.get('course') or '').strip()}%")
+            ).fetchall()]
+            course_rows = [x for x in candidates if normalise_key(x.get("course")) == course_key]
+
+        relevant_course_races = course_rows
+        relevant_course_type_distance = []
+        relevant_course_type_distance_going = []
+        same_named_race = []
+        for hr in course_rows:
+            same_type = not race_type or normalise_key(hr.get("race_type")) == race_type
+            d = as_float(hr.get("distance_f"))
+            same_distance = distance is None or d is None or abs(d - distance) <= 1.5
+            if same_type and same_distance:
+                relevant_course_type_distance.append(hr)
+                if _going_family(hr.get("going")) == going_family and going_family != "unknown":
+                    relevant_course_type_distance_going.append(hr)
+            if race_name_key and normalise_key(hr.get("race_name")) == race_name_key:
+                same_named_race.append(hr)
+
+        course_keys = [x["race_key"] for x in relevant_course_races]
+        context_keys = [x["race_key"] for x in relevant_course_type_distance]
+        context_runs, context_wins = aggregate_runners_for_keys(con, context_keys)
+
+        for item in runners:
+            horse_name = str(item.get("runner_name") or item.get("horse_name") or "").strip()
+            horse_key = normalise_key(horse_name)
+            # The SFF archive's horse_key is a normalised horse name. The API may use an
+            # ID as horse_key, so match by name as well even when horse_id is present.
+            horse_rows = [row_dict(x) for x in con.execute(
+                "SELECT hrn.race_key, hrn.horse_name, hrn.finishing_position, hrn.trainer, hrn.jockey, "
+                "hr.race_date AS hist_race_date, hr.course AS hist_course, hr.distance_f AS hist_distance_f, hr.going AS hist_going "
+                "FROM historical_runners hrn JOIN historical_races hr ON hr.race_key = hrn.race_key "
+                "WHERE hr.race_date < ? AND (hrn.horse_key = ? OR hrn.horse_name = ?)",
+                (target_date, horse_key, horse_name)
+            ).fetchall()]
+            horse_runs = horse_rows
+            wins = sum(1 for rr in horse_runs if rr.get("finishing_position") == 1)
+            top3 = sum(1 for rr in horse_runs if rr.get("finishing_position") is not None and rr["finishing_position"] <= 3)
+            course_runs = [rr for rr in horse_runs if normalise_key(rr.get("hist_course")) == course_key]
+            course_wins = sum(1 for rr in course_runs if rr.get("finishing_position") == 1)
+            distance_runs = [rr for rr in horse_runs if distance is not None and as_float(rr.get("hist_distance_f")) is not None and abs(as_float(rr.get("hist_distance_f")) - distance) <= 1.5]
+            going_runs = [rr for rr in horse_runs if _going_family(rr.get("hist_going")) == going_family and going_family != "unknown"]
+            item["history_runs"] = len(horse_runs)
+            item["history_wins"] = wins
+            item["history_win_rate_pct"] = round(100 * wins / len(horse_runs), 1) if horse_runs else None
+            item["history_top3_rate_pct"] = round(100 * top3 / len(horse_runs), 1) if horse_runs else None
+            item["course_runs"] = len(course_runs)
+            item["course_wins"] = course_wins
+            item["course_win_rate_pct"] = round(100 * course_wins / len(course_runs), 1) if course_runs else None
+            item["distance_runs"] = len(distance_runs)
+            item["distance_wins"] = sum(1 for rr in distance_runs if rr.get("finishing_position") == 1)
+            item["going_runs"] = len(going_runs)
+            item["going_wins"] = sum(1 for rr in going_runs if rr.get("finishing_position") == 1)
+            item["history_sample_note"] = "RacingFormBook/API local archive; only prior dated results counted" if horse_runs else "No matching prior results found in local archive"
+
+            for field, cache, output_runs, output_wins in (
+                ("trainer", trainer_cache, "trainer_history_runs", "trainer_history_wins"),
+                ("jockey", jockey_cache, "jockey_history_runs", "jockey_history_wins"),
+            ):
+                person = str(item.get(field) or "").strip()
+                person_key = normalise_key(person)
+                if person_key not in cache:
+                    stats = {"runs": 0, "wins": 0}
+                    if person:
+                        # Exact match first uses the existing trainer/jockey indexes.
+                        row = row_dict(con.execute(
+                            f"SELECT COUNT(*) AS runs, SUM(CASE WHEN hrn.finishing_position=1 THEN 1 ELSE 0 END) AS wins "
+                            f"FROM historical_runners hrn JOIN historical_races hr ON hr.race_key=hrn.race_key "
+                            f"WHERE hr.race_date < ? AND hrn.{field} = ?",
+                            (target_date, person)
+                        ).fetchone())
+                        stats = {"runs": int(row.get("runs") or 0), "wins": int(row.get("wins") or 0)}
+                        if stats["runs"] == 0:
+                            row = row_dict(con.execute(
+                                f"SELECT COUNT(*) AS runs, SUM(CASE WHEN hrn.finishing_position=1 THEN 1 ELSE 0 END) AS wins "
+                                f"FROM historical_runners hrn JOIN historical_races hr ON hr.race_key=hrn.race_key "
+                                f"WHERE hr.race_date < ? AND lower(trim(hrn.{field})) = lower(trim(?))",
+                                (target_date, person)
+                            ).fetchone())
+                            stats = {"runs": int(row.get("runs") or 0), "wins": int(row.get("wins") or 0)}
+                    cache[person_key] = stats
+                stats = cache[person_key]
+                item[output_runs] = stats["runs"]
+                item[output_wins] = stats["wins"]
+                rate_key = "trainer_win_rate_pct" if field == "trainer" else "jockey_win_rate_pct"
+                item[rate_key] = round(100 * stats["wins"] / stats["runs"], 1) if stats["runs"] else None
+
+            item["course_race_history_count"] = len(relevant_course_races)
+            item["course_type_distance_races"] = len(relevant_course_type_distance)
+            item["course_type_distance_going_races"] = len(relevant_course_type_distance_going)
+            item["named_race_history_count"] = len(same_named_race)
+            item["course_context_winner_rate_pct"] = round(100 * context_wins / context_runs, 1) if context_runs else None
     return runners
 
 def form_proxy(form):
@@ -1046,6 +1105,30 @@ def build_report(date, meeting_name):
                 r.get("source_name"), r.get("source_url"), r.get("source_updated_at"),
                 "Fictional demo data" if (r.get("source_name") or "").startswith("DEMO") else ""
             ])
+    shortlist_rows = []
+    for race, runners in races:
+        enriched = enrich_race(runners, race)
+        active_ranked = [r for r in enriched if not r.get("non_runner")]
+        active_ranked.sort(key=lambda r: (r.get("screening_index") is None, -(r.get("screening_index") or 0), str(r.get("runner_name") or "").lower()))
+        for selection_rank, r in enumerate(active_ranked[:3], start=1):
+            shortlist_rows.append([
+                race.get("race_time"), race.get("race_name"), selection_rank, r.get("runner_name"),
+                r.get("screening_index"), r.get("coverage_pct"), r.get("confidence"),
+                r.get("history_runs"), r.get("history_wins"), r.get("history_win_rate_pct"), r.get("history_top3_rate_pct"),
+                r.get("course_runs"), r.get("course_wins"), r.get("distance_runs"), r.get("distance_wins"),
+                r.get("going_runs"), r.get("going_wins"), r.get("trainer_history_runs"), r.get("trainer_history_wins"),
+                r.get("trainer_win_rate_pct"), r.get("jockey_history_runs"), r.get("jockey_history_wins"),
+                r.get("jockey_win_rate_pct"), r.get("official_rating"), r.get("recent_form"), r.get("last_run_days"),
+                r.get("analysis_flags"), r.get("history_sample_note")
+            ])
+    add_table_sheet(wb, "Selection Shortlist", [
+        "Race Time", "Race", "Shortlist Rank", "Runner", "Screening Index (not probability)", "Factor Coverage %", "Evidence Coverage",
+        "Historical Runs", "Historical Wins", "Historical Win %", "Historical Top-3 %", "Course Runs", "Course Wins",
+        "Distance-Similar Runs", "Distance-Similar Wins", "Going-Family Runs", "Going-Family Wins",
+        "Trainer Runs", "Trainer Wins", "Trainer Win %", "Jockey Runs", "Jockey Wins", "Jockey Win %",
+        "Official Rating", "Recent Form", "Days Since Last Run", "Flags", "History Match Note"
+    ], shortlist_rows)
+
     add_table_sheet(wb, "Runner Database", [
         "Race Time","Race","Type","Class","Distance (f)","Going","Surface","Field Size","Cloth","Runner","Age","Sex","Weight (lb)",
         "Official Rating","Speed Figure (sourced)","Performance Rating (sourced)","Recent Form","Days Since Last Run","Recency Profile",
@@ -1087,7 +1170,7 @@ def build_report(date, meeting_name):
         ["Sourced performance rating", "24% nominal weight when available; percentile-ranked within this field."],
         ["Official rating", "15% nominal weight when available; percentile-ranked within this field."],
         ["Recent-form proxy", "15% nominal weight; simple finishing-position heuristic, not yet calibrated."],
-        ["Horse history", "5% nominal weight; historical win/top-three record shrunk towards a baseline; needs at least two stored runs."],
+        ["Horse history", "5% nominal weight; matches archive history by normalised horse name (including SFF records without API horse IDs); historical win/top-three record shrunk towards a baseline; needs at least two stored runs."],
         ["Course/distance/going history", "Small nominal weights; uses stored wins/runs, requires at least two comparable runs and shrinks small samples."],
         ["Trainer/jockey history", "Small nominal weights; uses local stored wins/runs only with at least 20 stored runs; shrunk towards baseline."],
         ["Recency", "2% nominal weight; heuristic only and not empirically validated."],
