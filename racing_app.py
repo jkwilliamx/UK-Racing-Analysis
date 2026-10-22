@@ -5,6 +5,7 @@ import json
 import math
 import os
 import sqlite3
+import re
 import io
 import zipfile
 from datetime import datetime, timezone
@@ -46,7 +47,63 @@ FACTOR_WEIGHTS = {
     "recency": 0.02,
 }
 
+def _database_url():
+    """Read the hosted database URL from environment or Streamlit secrets."""
+    url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+    if url:
+        return url.strip()
+    try:
+        import streamlit as st
+        value = st.secrets.get("SUPABASE_DB_URL", "")
+        return str(value).strip() if value else None
+    except Exception:
+        return None
+
+
+class _PostgresConnection:
+    """Small compatibility wrapper for the SQLite-style SQL used by this app."""
+    def __init__(self, raw):
+        self.raw = raw
+
+    def __enter__(self):
+        self.raw.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return self.raw.__exit__(exc_type, exc, tb)
+
+    @staticmethod
+    def _sql(sql):
+        # The app's parameterized SQL uses SQLite '?' placeholders throughout.
+        return sql.replace('?', '%s')
+
+    def execute(self, sql, params=()):
+        return self.raw.execute(self._sql(sql), params or ())
+
+    def executemany(self, sql, params):
+        return self.raw.executemany(self._sql(sql), params)
+
+    def executescript(self, script):
+        # Schema statements in init_db contain no semicolons inside string literals.
+        for statement in script.split(';'):
+            if statement.strip():
+                self.raw.execute(statement.strip())
+
+
 def connect():
+    database_url = _database_url()
+    if database_url:
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:
+            raise RuntimeError(
+                "Supabase is configured but the PostgreSQL driver is missing. "
+                "Add psycopg[binary] to requirements.txt and redeploy."
+            ) from exc
+        # Supabase Transaction Pooler works with hosted Streamlit. Enforce TLS.
+        return _PostgresConnection(psycopg.connect(database_url, sslmode="require", row_factory=dict_row, prepare_threshold=None))
+
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -55,7 +112,7 @@ def connect():
 
 def init_db():
     with connect() as con:
-        con.executescript("""
+        schema_sql = """
         CREATE TABLE IF NOT EXISTS meetings (
             id INTEGER PRIMARY KEY,
             meeting_date TEXT NOT NULL,
@@ -180,7 +237,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_races_meeting ON races(meeting_id);
         CREATE INDEX IF NOT EXISTS idx_runners_race ON runners(race_id);
         CREATE INDEX IF NOT EXISTS idx_sources_runner ON source_records(runner_id);
-        """)
+        """
+        if isinstance(con, _PostgresConnection):
+            schema_sql = re.sub(r"\bINTEGER\s+PRIMARY KEY\b", "BIGSERIAL PRIMARY KEY", schema_sql, flags=re.IGNORECASE)
+        con.executescript(schema_sql)
         # Lightweight migrations let existing local databases upgrade in place.
         _ensure_columns(con, "races", {
             "race_class": "TEXT", "field_size": "INTEGER", "surface": "TEXT", "prize": "TEXT",
@@ -195,7 +255,14 @@ def init_db():
         })
 
 def _ensure_columns(con, table, columns):
-    existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
+    if isinstance(con, _PostgresConnection):
+        rows = con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ?", (table,)
+        ).fetchall()
+        existing = {row["column_name"] for row in rows}
+    else:
+        existing = {row[1] for row in con.execute(f"PRAGMA table_info({table})").fetchall()}
     for name, sql_type in columns.items():
         if name not in existing:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
