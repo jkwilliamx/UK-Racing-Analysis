@@ -2,7 +2,9 @@ from __future__ import annotations
 import csv
 import io
 import sys
-from datetime import datetime
+from datetime import datetime, date, timedelta
+import time
+from urllib.parse import quote
 from pathlib import Path
 
 import streamlit as st
@@ -37,7 +39,7 @@ def _first(item, *keys, default=""):
 
 
 def fetch_free_racecards(username: str, password: str, day: str, include_ireland: bool = False) -> tuple[int, int, list[str]]:
-    """Fetch basic racecards from The Racing API Free endpoint and import them locally."""
+    """Fetch basic racecards from The Racing API Basic endpoint and import them locally."""
     region_codes = "gb,ire" if include_ireland else "gb"
     response = requests.get(
         API_BASE,
@@ -100,7 +102,7 @@ def fetch_free_racecards(username: str, password: str, day: str, include_ireland
                 "trainer": _first(runner, "trainer", default=""),
                 "jockey": _first(runner, "jockey", default=""),
                 "non_runner": "yes" if non_runner else "no",
-                "source_name": "The Racing API Free",
+                "source_name": "The Racing API Basic",
                 "source_url": API_DOCS,
                 "source_updated_at": stamp,
                 "race_class": _first(race, "race_class", "class", default=""),
@@ -154,6 +156,78 @@ def sync_free_results(username: str, password: str, include_ireland: bool = Fals
     response.raise_for_status()
     return core.store_historical_results(response.json(), RESULTS_API_BASE)
 
+
+def fetch_historical_horse_results(username: str, password: str, include_ireland: bool = False) -> tuple[int, int, int, list[str]]:
+    """Fetch past results for unique horse IDs in upcoming racecards using the Basic endpoint."""
+    core.init_db()
+    today = date.today().isoformat()
+    end_date = today
+    start_date = (date.today() - timedelta(days=3650)).isoformat()
+    with core.connect() as con:
+        horses = con.execute(
+            "SELECT DISTINCT runners.horse_id, runners.runner_name "
+            "FROM runners JOIN races ON races.id=runners.race_id "
+            "JOIN meetings ON meetings.id=races.meeting_id "
+            "WHERE runners.horse_id IS NOT NULL AND TRIM(runners.horse_id)<>'' "
+            "AND meetings.meeting_date>=? ORDER BY runners.horse_id", (today,)
+        ).fetchall()
+    if not horses:
+        raise ValueError("No upcoming runners with horse IDs were found. Fetch today's or tomorrow's racecards first.")
+
+    total_races = total_runner_records = successful_horses = 0
+    failures = []
+    for index, horse in enumerate(horses):
+        horse_id = str(horse["horse_id"]).strip()
+        url = "https://api.theracingapi.com/v1/racecards/" + quote(horse_id, safe="") + "/results"
+        try:
+            response = requests.get(
+                url, params={"start_date": start_date, "end_date": end_date},
+                auth=HTTPBasicAuth(username, password), timeout=45
+            )
+            if response.status_code in (401, 403):
+                raise ValueError("The API denied access. Check your Basic subscription and API credentials.")
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results", []) if isinstance(payload, dict) else payload
+            if not isinstance(results, list):
+                raise ValueError("Unexpected response: no results list was returned.")
+            normalised = []
+            for item in results:
+                if not isinstance(item, dict):
+                    continue
+                # Some responses provide one race with nested runners; horse-specific results
+                # may instead return the runner's own result fields on each result object.
+                race = dict(item)
+                nested = race.get("runners")
+                if not isinstance(nested, list) or not nested:
+                    runner = dict(item)
+                    runner.setdefault("horse_id", horse_id)
+                    runner.setdefault("horse", str(horse["runner_name"]))
+                    race["runners"] = [runner]
+                normalised.append(race)
+            if normalised:
+                race_count, runner_count = core.store_historical_results(
+                    {"results": normalised}, "https://api.theracingapi.com/v1/racecards/{horse_id}/results"
+                )
+                total_races += race_count
+                total_runner_records += runner_count
+            successful_horses += 1
+        except Exception as exc:
+            failures.append(f"{horse_id} ({horse['runner_name']}): {exc}")
+        # Documented limit is 5 requests/second; this stays comfortably below it.
+        if index < len(horses) - 1:
+            time.sleep(0.22)
+
+    # Rebuild reports for upcoming dates after history has been stored.
+    dates = []
+    with core.connect() as con:
+        dates = [row[0] for row in con.execute(
+            "SELECT DISTINCT meeting_date FROM meetings WHERE meeting_date>=? ORDER BY meeting_date", (today,)
+        ).fetchall()]
+    for date_value in dates:
+        generate_reports_for_dates([date_value])
+    return successful_horses, len(horses), total_runner_records, failures
+
 def generate_reports_for_dates(dates: list[str]) -> tuple[int, list[str]]:
     """Automatically calculate all reports for the dates just fetched."""
     core.init_db()
@@ -178,7 +252,7 @@ def generate_reports_for_dates(dates: list[str]) -> tuple[int, list[str]]:
 
 with st.sidebar:
     st.header("1. Fetch and analyse")
-    st.caption("Requires a free account at The Racing API. Credentials are used for this request and are not saved by this app.")
+    st.caption("Requires The Racing API credentials. Credentials are used for requests and are not saved by this app.")
     api_username = st.text_input("API username", key="racing_api_username")
     api_password = st.text_input("API password", type="password", key="racing_api_password")
     api_day = st.selectbox("Racecard date", ["today", "tomorrow"], index=0)
@@ -216,6 +290,30 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Historical results sync failed: {e}")
 
+    if st.button("Fetch Historical Horse Results (Basic)", use_container_width=True):
+        if not api_username.strip() or not api_password:
+            st.error("Enter your API username and password first.")
+        else:
+            try:
+                with st.spinner("Fetching historical results for declared horses. This may take a few minutes..."):
+                    success_count, horse_count, result_count, history_errors = fetch_historical_horse_results(
+                        api_username.strip(), api_password, include_ireland
+                    )
+                st.session_state["last_horse_history_summary"] = (
+                    f"Historical horse lookup finished: {success_count}/{horse_count} horses checked; "
+                    f"{result_count} historical runner records stored."
+                )
+                if history_errors:
+                    st.warning(st.session_state["last_horse_history_summary"] + f" {len(history_errors)} lookups failed; see details below.")
+                    with st.expander("Historical lookup errors"):
+                        st.write("\n".join(history_errors[:30]))
+                else:
+                    st.success(st.session_state["last_horse_history_summary"])
+                st.rerun()
+            except requests.RequestException as e:
+                st.error(f"Could not reach The Racing API: {e}")
+            except Exception as e:
+                st.error(f"Historical horse-results fetch failed: {e}")
     with st.expander("Optional: manual CSV import"):
         st.caption("The normal workflow does not require spreadsheets. This is only for advanced testing or a future alternate data source.")
         uploaded = st.file_uploader("Racecard CSV", type=["csv"])
@@ -247,6 +345,8 @@ if st.session_state.get("last_pipeline_summary"):
     st.success(st.session_state["last_pipeline_summary"])
 if st.session_state.get("last_history_summary"):
     st.info(st.session_state["last_history_summary"])
+if st.session_state.get("last_horse_history_summary"):
+    st.success(st.session_state["last_horse_history_summary"])
 with core.connect() as con:
     meetings = con.execute(
         "SELECT meeting_date, meeting_name, course, COUNT(DISTINCT races.id) AS race_count, "
