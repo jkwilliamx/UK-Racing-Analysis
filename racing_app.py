@@ -170,6 +170,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_races_meeting ON races(meeting_id);
         CREATE INDEX IF NOT EXISTS idx_runners_race ON runners(race_id);
         CREATE INDEX IF NOT EXISTS idx_sources_runner ON source_records(runner_id);
+        CREATE TABLE IF NOT EXISTS horse_history_sync (
+            horse_id TEXT PRIMARY KEY,
+            last_attempt_at TEXT NOT NULL,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'ok',
+            note TEXT
+        );
         """)
         # Lightweight migrations let existing local databases upgrade in place.
         _ensure_columns(con, "races", {
@@ -332,8 +339,11 @@ def _result_position(runner):
                 if val.upper() in {"1ST", "WON"}: return 1
     return None
 
-def store_historical_results(payload, source_url="https://api.theracingapi.com/v1/results/today/free"):
-    """Store only the free API's returned results locally; idempotent on repeated syncs."""
+def store_historical_results(payload, source_url="https://api.theracingapi.com/v1/results/today"):
+    """Store race results returned by a supported Racing API results endpoint.
+
+    Repeated imports update existing race/runner rows instead of duplicating them.
+    """
     init_db()
     races = payload.get("results", []) if isinstance(payload, dict) else payload
     if not isinstance(races, list):
@@ -367,7 +377,7 @@ def store_historical_results(payload, source_url="https://api.theracingapi.com/v
                  nullable_str(_first_value(race,"type","race_type",default="")),distance,
                  nullable_str(_first_value(race,"going","going_detailed",default="")),
                  nullable_str(_first_value(race,"class","race_class",default="")),as_int(race.get("field_size") or len(runners)),
-                 "The Racing API Free results",source_url,stamp))
+                 "The Racing API results",source_url,stamp))
             race_count += 1
             for runner in runners:
                 if not isinstance(runner, dict): continue
@@ -391,7 +401,7 @@ def store_historical_results(payload, source_url="https://api.theracingapi.com/v
                      nullable_str(_first_value(runner,"trainer_id",default="")),nullable_str(_first_value(runner,"jockey",default="")),
                      nullable_str(_first_value(runner,"jockey_id",default="")),nullable_str(_first_value(runner,"sp","starting_price",default="")),
                      nullable_str(_first_value(runner,"btn","beaten_distance","distance_beaten",default="")),
-                     nullable_str(_first_value(runner,"comments","comment",default="")),"The Racing API Free results",stamp))
+                     nullable_str(_first_value(runner,"comments","comment",default="")),"The Racing API results",stamp))
                 runner_count += 1
     return race_count, runner_count
 
@@ -401,6 +411,71 @@ def _first_value(obj, *keys, default=None):
         if val not in (None, ""):
             return val
     return default
+
+def get_horse_history_sync_status(horse_id):
+    """Return cached history-sync metadata for one horse ID, if present."""
+    init_db()
+    with connect() as con:
+        row = con.execute("SELECT * FROM horse_history_sync WHERE horse_id=?", (str(horse_id),)).fetchone()
+        return dict(row) if row else None
+
+def record_horse_history_sync(horse_id, result_count, status="ok", note=None):
+    """Remember a horse-history request so repeated app runs avoid needless API calls."""
+    init_db()
+    with connect() as con:
+        con.execute("""INSERT INTO horse_history_sync(horse_id,last_attempt_at,result_count,status,note)
+            VALUES(?,?,?,?,?) ON CONFLICT(horse_id) DO UPDATE SET
+            last_attempt_at=excluded.last_attempt_at,result_count=excluded.result_count,
+            status=excluded.status,note=excluded.note""",
+            (str(horse_id), now_utc(), int(result_count or 0), str(status), nullable_str(note)))
+
+def shortlist_reasons(r):
+    """Produce plain-language reasons and cautions using only available fields."""
+    reasons = []
+    concerns = []
+    if as_float(r.get("screening_index")) is not None:
+        rank = r.get("screening_rank")
+        if rank == 1:
+            reasons.append("Top race-relative screening score")
+        elif rank in (2, 3):
+            reasons.append(f"Strong race-relative screening score (rank {rank})")
+    if as_float(r.get("speed_figure")) is not None:
+        reasons.append("Sourced speed figure available")
+    if as_float(r.get("performance_rating")) is not None:
+        reasons.append("Sourced performance rating available")
+    if as_float(r.get("official_rating")) is not None:
+        reasons.append("Official rating available")
+    if r.get("recent_form"):
+        form = str(r.get("recent_form"))
+        proxy = as_float(r.get("form_proxy"))
+        if proxy is not None and proxy >= 0.6:
+            reasons.append(f"Recent form looks encouraging ({form})")
+        else:
+            concerns.append(f"Recent form needs scrutiny ({form})")
+    if as_int(r.get("history_runs")):
+        runs = as_int(r.get("history_runs")) or 0
+        wins = as_int(r.get("history_wins")) or 0
+        if wins:
+            reasons.append(f"Historical record: {wins} win(s) from {runs} stored run(s)")
+        else:
+            concerns.append(f"No wins in {runs} stored historical run(s)")
+    else:
+        concerns.append("No historical runs currently stored for this horse")
+    if as_int(r.get("course_runs")):
+        if (as_int(r.get("course_wins")) or 0) > 0:
+            reasons.append("Has a recorded win at this course")
+        else:
+            concerns.append("Course experience stored, but no course win recorded")
+    if as_int(r.get("distance_runs")) and (as_int(r.get("distance_wins")) or 0) > 0:
+        reasons.append("Has a recorded win at a similar distance")
+    if as_int(r.get("going_runs")) and (as_int(r.get("going_wins")) or 0) > 0:
+        reasons.append("Has a recorded win on similar going")
+    if not r.get("speed_figure") and not r.get("performance_rating"):
+        concerns.append("No sourced speed or performance rating")
+    if r.get("confidence", "").startswith("Low") or r.get("confidence", "").startswith("Insufficient"):
+        concerns.append("Low rating-data coverage; ranking is especially uncertain")
+    return ("; ".join(reasons) if reasons else "Limited evidence available",
+            "; ".join(concerns) if concerns else "No major automated caution; review race manually")
 
 def _going_family(value):
     text = normalise_key(value)
@@ -868,6 +943,39 @@ def build_report(date, meeting_name):
         "Jockey Runs Stored", "Jockey Win Rate % (local)", "Scoring Method", "Historical Data Note"
     ], assessment_rows)
 
+    # Compact top-three shortlist, one row per selected runner per race.
+    shortlist_rows = []
+    for race, runners in races:
+        scored = []
+        for r in runners:
+            assessment = selection_assessment(r)
+            score = assessment.get("candidate_score")
+            if score is None:
+                score = as_float(r.get("screening_index"))
+            reasons, concerns = shortlist_reasons(r)
+            scored.append((r, assessment, score, reasons, concerns))
+        scored.sort(key=lambda item: (item[2] is None, -(item[2] or 0), item[0].get("runner_name", "").lower()))
+        ranked = [item for item in scored if item[2] is not None][:3]
+        if not ranked:
+            ranked = scored[:3]
+        for rank, (r, assessment, score, reasons, concerns) in enumerate(ranked, start=1):
+            shortlist_rows.append([
+                race.get("race_time"), race.get("race_name"), rank, r.get("runner_name"),
+                round(score, 1) if score is not None else None,
+                r.get("screening_index"), r.get("official_rating"), r.get("speed_figure"),
+                r.get("performance_rating"), r.get("recent_form"), reasons, concerns,
+                assessment.get("evidence_coverage_pct"), r.get("history_runs", 0),
+                r.get("course_runs", 0), r.get("distance_runs", 0), r.get("going_runs", 0),
+                "Heuristic shortlist; not a win probability"
+            ])
+    add_table_sheet(wb, "Selection Shortlist", [
+        "Race Time", "Race", "Shortlist Rank", "Horse", "Candidate Score (heuristic)",
+        "Screening Index", "Official Rating", "Sourced Speed Figure", "Sourced Performance Rating",
+        "Recent Form", "Why shortlisted", "Concerns / checks", "Historical Evidence Coverage %",
+        "Stored Horse Runs", "Course Runs Stored", "Similar-Distance Runs Stored", "Similar-Going Runs Stored",
+        "Interpretation"
+    ], shortlist_rows)
+
     history_rows = []
     for race, runners in races:
         if runners:
@@ -904,7 +1012,8 @@ def build_report(date, meeting_name):
         ["Pedigree", "Sire, dam and damsire are displayed when available; no unsupported suitability claim is inferred."],
         ["Not inferred from racecard alone", "Course/distance/going record, stamina, pace, jumping, fitness and trainer/jockey strike rates require historical datasets."],
         ["Speed modelling", "Do not estimate speed from racecard alone. Reliable time, distance, course and going data plus calibration are required."],
-        ["Selection Assessment sheet", "Separate heuristic shortlist using course, similar-distance, going-family, trainer, jockey and recent-form evidence when available."],
+        ["Selection Assessment sheet", "Separate heuristic assessment using course, similar-distance, going-family, trainer, jockey and recent-form evidence when available."],
+        ["Selection Shortlist sheet", "Shows up to three contenders per race, with plain-language supporting evidence and cautions. It is not a probability-of-winning model."],
         ["Candidate Score", "When at least 3 of 6 evidence categories are available: 60% Screening Index + 40% evidence score. Otherwise the score falls back to Screening Index only."],
         ["Evidence points", "Each available category is scored 0-2 using transparent rules; missing history is left blank and does not count against a runner."],
         ["Historical archive limitation", "Course, distance, going, trainer and jockey stats only reflect results stored in this app; they are not complete external career records."],
@@ -1021,3 +1130,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
