@@ -386,8 +386,8 @@ with core.connect() as con:
     ).fetchall()
 
 with core.connect() as con:
-    historical_race_count = con.execute("SELECT COUNT(*) FROM historical_races").fetchone()[0]
-    historical_runner_count = con.execute("SELECT COUNT(*) FROM historical_runners").fetchone()[0]
+    historical_race_count = con.execute("SELECT COUNT(*) AS count FROM historical_races").fetchone()["count"]
+    historical_runner_count = con.execute("SELECT COUNT(*) AS count FROM historical_runners").fetchone()["count"]
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Meetings in database", len(meetings))
 col2.metric("Current race rows", sum(m["race_count"] or 0 for m in meetings))
