@@ -141,12 +141,11 @@ def fetch_free_racecards(username: str, password: str, day: str, include_ireland
     return race_count, runner_count, sorted(fetched_dates)
 
 def sync_free_results(username: str, password: str, include_ireland: bool = False) -> tuple[int, int]:
-    """Fetch today's results and append/update the local historical archive."""
+    """Fetch today's basic results and append/update the local historical archive."""
     region_codes = "gb,ire" if include_ireland else "gb"
     response = requests.get(
         RESULTS_API_BASE,
-        # The API documents a default page size of 50; avoid the rejected 500 limit.
-        params={"region": region_codes, "limit": 50, "skip": 0},
+        params={"region": region_codes, "limit": 500, "skip": 0},
         auth=HTTPBasicAuth(username, password),
         timeout=45,
     )
@@ -387,8 +386,8 @@ with core.connect() as con:
     ).fetchall()
 
 with core.connect() as con:
-    historical_race_count = con.execute("SELECT COUNT(*) FROM historical_races").fetchone()[0]
-    historical_runner_count = con.execute("SELECT COUNT(*) FROM historical_runners").fetchone()[0]
+    historical_race_count = con.execute("SELECT COUNT(*) AS count FROM historical_races").fetchone()["count"]
+    historical_runner_count = con.execute("SELECT COUNT(*) AS count FROM historical_runners").fetchone()["count"]
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Meetings in database", len(meetings))
 col2.metric("Current race rows", sum(m["race_count"] or 0 for m in meetings))
