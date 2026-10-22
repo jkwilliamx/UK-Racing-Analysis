@@ -23,9 +23,9 @@ st.info(
     "Missing speed/performance ratings are not invented; historical statistics are labelled with their stored sample size."
 )
 
-API_BASE = "https://api.theracingapi.com/v1/racecards/free"
+API_BASE = "https://api.theracingapi.com/v1/racecards/basic"
 API_DOCS = "https://api.theracingapi.com/documentation"
-RESULTS_API_BASE = "https://api.theracingapi.com/v1/results/today/free"
+RESULTS_API_BASE = "https://api.theracingapi.com/v1/results/today"
 
 
 def _first(item, *keys, default=""):
