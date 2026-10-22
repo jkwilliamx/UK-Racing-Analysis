@@ -83,7 +83,7 @@ class _PostgresConnection:
     def executemany(self, sql, params):
         return self.raw.executemany(self._sql(sql), params)
 
-    def execute_script(self, script):
+    def executescript(self, script):
         for statement in script.split(';'):
             statement = statement.strip()
             if not statement:
