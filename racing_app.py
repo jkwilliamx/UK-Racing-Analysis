@@ -83,33 +83,33 @@ class _PostgresConnection:
     def executemany(self, sql, params):
         return self.raw.executemany(self._sql(sql), params)
 
-   def execute_script(self, script):
-    # Skip existing PostgreSQL tables before executing BIGSERIAL
-    # declarations, which can otherwise collide with existing sequences.
-    for statement in script.split(';'):
-        statement = statement.strip()
-        if not statement:
-            continue
-
-        match = re.match(
-            r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)",
-            statement,
-            flags=re.IGNORECASE,
-        )
-
-        if match:
-            table_name = match.group(1)
-            existing = self.raw.execute(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_schema = current_schema() "
-                "AND table_name = %s",
-                (table_name,),
-            ).fetchone()
-
-            if existing:
+       def execute_script(self, script):
+        # Skip existing PostgreSQL tables before executing BIGSERIAL
+        # declarations, which can otherwise collide with existing sequences.
+        for statement in script.split(';'):
+            statement = statement.strip()
+            if not statement:
                 continue
 
-        self.raw.execute(statement)
+            match = re.match(
+                r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)",
+                statement,
+                flags=re.IGNORECASE,
+            )
+
+            if match:
+                table_name = match.group(1)
+                existing = self.raw.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name = %s",
+                    (table_name,),
+                ).fetchone()
+
+                if existing:
+                    continue
+
+            self.raw.execute(statement)
 
 
 def connect():
