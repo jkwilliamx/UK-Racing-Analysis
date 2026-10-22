@@ -83,9 +83,7 @@ class _PostgresConnection:
     def executemany(self, sql, params):
         return self.raw.executemany(self._sql(sql), params)
 
-       def execute_script(self, script):
-        # Skip existing PostgreSQL tables before executing BIGSERIAL
-        # declarations, which can otherwise collide with existing sequences.
+    def execute_script(self, script):
         for statement in script.split(';'):
             statement = statement.strip()
             if not statement:
@@ -110,7 +108,6 @@ class _PostgresConnection:
                     continue
 
             self.raw.execute(statement)
-
 
 def connect():
     database_url = _database_url()
