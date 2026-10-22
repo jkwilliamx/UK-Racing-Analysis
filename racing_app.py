@@ -170,13 +170,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_races_meeting ON races(meeting_id);
         CREATE INDEX IF NOT EXISTS idx_runners_race ON runners(race_id);
         CREATE INDEX IF NOT EXISTS idx_sources_runner ON source_records(runner_id);
-        CREATE TABLE IF NOT EXISTS horse_history_sync (
-            horse_id TEXT PRIMARY KEY,
-            last_attempt_at TEXT NOT NULL,
-            result_count INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'ok',
-            note TEXT
-        );
         """)
         # Lightweight migrations let existing local databases upgrade in place.
         _ensure_columns(con, "races", {
@@ -340,10 +333,7 @@ def _result_position(runner):
     return None
 
 def store_historical_results(payload, source_url="https://api.theracingapi.com/v1/results/today"):
-    """Store race results returned by a supported Racing API results endpoint.
-
-    Repeated imports update existing race/runner rows instead of duplicating them.
-    """
+    """Store only the free API's returned results locally; idempotent on repeated syncs."""
     init_db()
     races = payload.get("results", []) if isinstance(payload, dict) else payload
     if not isinstance(races, list):
@@ -377,7 +367,7 @@ def store_historical_results(payload, source_url="https://api.theracingapi.com/v
                  nullable_str(_first_value(race,"type","race_type",default="")),distance,
                  nullable_str(_first_value(race,"going","going_detailed",default="")),
                  nullable_str(_first_value(race,"class","race_class",default="")),as_int(race.get("field_size") or len(runners)),
-                 "The Racing API results",source_url,stamp))
+                 "The Racing API Basic horse results",source_url,stamp))
             race_count += 1
             for runner in runners:
                 if not isinstance(runner, dict): continue
@@ -401,7 +391,7 @@ def store_historical_results(payload, source_url="https://api.theracingapi.com/v
                      nullable_str(_first_value(runner,"trainer_id",default="")),nullable_str(_first_value(runner,"jockey",default="")),
                      nullable_str(_first_value(runner,"jockey_id",default="")),nullable_str(_first_value(runner,"sp","starting_price",default="")),
                      nullable_str(_first_value(runner,"btn","beaten_distance","distance_beaten",default="")),
-                     nullable_str(_first_value(runner,"comments","comment",default="")),"The Racing API results",stamp))
+                     nullable_str(_first_value(runner,"comments","comment",default="")),"The Racing API Basic horse results",stamp))
                 runner_count += 1
     return race_count, runner_count
 
@@ -411,71 +401,6 @@ def _first_value(obj, *keys, default=None):
         if val not in (None, ""):
             return val
     return default
-
-def get_horse_history_sync_status(horse_id):
-    """Return cached history-sync metadata for one horse ID, if present."""
-    init_db()
-    with connect() as con:
-        row = con.execute("SELECT * FROM horse_history_sync WHERE horse_id=?", (str(horse_id),)).fetchone()
-        return dict(row) if row else None
-
-def record_horse_history_sync(horse_id, result_count, status="ok", note=None):
-    """Remember a horse-history request so repeated app runs avoid needless API calls."""
-    init_db()
-    with connect() as con:
-        con.execute("""INSERT INTO horse_history_sync(horse_id,last_attempt_at,result_count,status,note)
-            VALUES(?,?,?,?,?) ON CONFLICT(horse_id) DO UPDATE SET
-            last_attempt_at=excluded.last_attempt_at,result_count=excluded.result_count,
-            status=excluded.status,note=excluded.note""",
-            (str(horse_id), now_utc(), int(result_count or 0), str(status), nullable_str(note)))
-
-def shortlist_reasons(r):
-    """Produce plain-language reasons and cautions using only available fields."""
-    reasons = []
-    concerns = []
-    if as_float(r.get("screening_index")) is not None:
-        rank = r.get("screening_rank")
-        if rank == 1:
-            reasons.append("Top race-relative screening score")
-        elif rank in (2, 3):
-            reasons.append(f"Strong race-relative screening score (rank {rank})")
-    if as_float(r.get("speed_figure")) is not None:
-        reasons.append("Sourced speed figure available")
-    if as_float(r.get("performance_rating")) is not None:
-        reasons.append("Sourced performance rating available")
-    if as_float(r.get("official_rating")) is not None:
-        reasons.append("Official rating available")
-    if r.get("recent_form"):
-        form = str(r.get("recent_form"))
-        proxy = as_float(r.get("form_proxy"))
-        if proxy is not None and proxy >= 0.6:
-            reasons.append(f"Recent form looks encouraging ({form})")
-        else:
-            concerns.append(f"Recent form needs scrutiny ({form})")
-    if as_int(r.get("history_runs")):
-        runs = as_int(r.get("history_runs")) or 0
-        wins = as_int(r.get("history_wins")) or 0
-        if wins:
-            reasons.append(f"Historical record: {wins} win(s) from {runs} stored run(s)")
-        else:
-            concerns.append(f"No wins in {runs} stored historical run(s)")
-    else:
-        concerns.append("No historical runs currently stored for this horse")
-    if as_int(r.get("course_runs")):
-        if (as_int(r.get("course_wins")) or 0) > 0:
-            reasons.append("Has a recorded win at this course")
-        else:
-            concerns.append("Course experience stored, but no course win recorded")
-    if as_int(r.get("distance_runs")) and (as_int(r.get("distance_wins")) or 0) > 0:
-        reasons.append("Has a recorded win at a similar distance")
-    if as_int(r.get("going_runs")) and (as_int(r.get("going_wins")) or 0) > 0:
-        reasons.append("Has a recorded win on similar going")
-    if not r.get("speed_figure") and not r.get("performance_rating"):
-        concerns.append("No sourced speed or performance rating")
-    if r.get("confidence", "").startswith("Low") or r.get("confidence", "").startswith("Insufficient"):
-        concerns.append("Low rating-data coverage; ranking is especially uncertain")
-    return ("; ".join(reasons) if reasons else "Limited evidence available",
-            "; ".join(concerns) if concerns else "No major automated caution; review race manually")
 
 def _going_family(value):
     text = normalise_key(value)
@@ -663,7 +588,7 @@ def enrich_race(runners):
     for idx, r in enumerate(active):
         present_weight = sum(FACTOR_WEIGHTS[k] for k in FACTOR_WEIGHTS if ranks[k][idx] is not None)
         score = None
-        # Free racecards often contain only official rating + form. Permit an indicative
+        # Basic racecards often contain only official rating + form. Permit an indicative
         # score at >=20% coverage, but label sparse scores clearly and never call them odds.
         if present_weight >= 0.20:
             score = sum(FACTOR_WEIGHTS[k] * ranks[k][idx] for k in FACTOR_WEIGHTS
@@ -770,76 +695,6 @@ def add_table_sheet(wb, title, headers, rows):
     style_sheet(ws)
     return ws
 
-
-def selection_assessment(r):
-    """Create a transparent evidence checklist from the locally stored history.
-
-    This is a heuristic shortlist aid, not a trained prediction model. Missing
-    history is left unknown and does not count against a runner.
-    """
-    components = {}
-
-    def count(name, value):
-        try:
-            return int(value or 0)
-        except (TypeError, ValueError):
-            return 0
-
-    # Horse-specific evidence: reward demonstrated success; otherwise treat
-    # limited exposure as unknown rather than assuming a negative.
-    course_runs, course_wins = count("course_runs", r.get("course_runs")), count("course_wins", r.get("course_wins"))
-    if course_runs > 0:
-        components["Cheltenham/course evidence"] = 2 if course_wins > 0 else (1 if course_runs >= 2 else 0)
-
-    distance_runs, distance_wins = count("distance_runs", r.get("distance_runs")), count("distance_wins", r.get("distance_wins"))
-    if distance_runs > 0:
-        components["Distance evidence"] = 2 if distance_wins > 0 else (1 if distance_runs >= 2 else 0)
-
-    going_runs, going_wins = count("going_runs", r.get("going_runs")), count("going_wins", r.get("going_wins"))
-    if going_runs > 0:
-        components["Going-family evidence"] = 2 if going_wins > 0 else (1 if going_runs >= 2 else 0)
-
-    # Trainer/jockey samples are from this app's locally stored archive only.
-    for label, runs_key, rate_key in [
-        ("Trainer record", "trainer_history_runs", "trainer_win_rate_pct"),
-        ("Jockey record", "jockey_history_runs", "jockey_win_rate_pct"),
-    ]:
-        runs = count(runs_key, r.get(runs_key))
-        rate = as_float(r.get(rate_key))
-        if runs >= 20 and rate is not None:
-            components[label] = 2 if rate >= 15 else (1 if rate >= 8 else 0)
-        elif runs >= 8 and rate is not None:
-            components[label] = 1 if rate >= 12 else 0
-
-    # The existing recent-form proxy is deliberately simple and not validated.
-    form = as_float(r.get("form_proxy"))
-    if form is not None:
-        components["Recent-form proxy"] = 2 if form >= 0.75 else (1 if form >= 0.50 else 0)
-
-    possible = len(components) * 2
-    earned = sum(components.values())
-    coverage = round(100 * len(components) / 6, 1)
-    evidence_score = round(100 * earned / possible, 1) if possible else None
-
-    # Only blend evidence into a candidate score when at least half of the six
-    # evidence categories have data. Otherwise retain the screening index alone.
-    screening = as_float(r.get("screening_index"))
-    if screening is not None and coverage >= 50 and evidence_score is not None:
-        candidate_score = round(0.60 * screening + 0.40 * evidence_score, 1)
-        method = "60% Screening Index + 40% evidence score"
-    elif screening is not None:
-        candidate_score = round(screening, 1)
-        method = "Screening Index only; insufficient context coverage"
-    else:
-        candidate_score = None
-        method = "Not scored; insufficient rating data"
-
-    return {
-        "components": components, "evidence_score": evidence_score,
-        "evidence_coverage_pct": coverage, "candidate_score": candidate_score,
-        "method": method, "earned_points": earned, "possible_points": possible,
-    }
-
 def build_report(date, meeting_name):
     init_db()
     with connect() as con:
@@ -909,73 +764,6 @@ def build_report(date, meeting_name):
         "Source","Source URL","Source Updated At","Notes"
     ], runner_rows)
 
-    # Separate ranked shortlist sheet: uses only evidence available in the local archive.
-    assessment_rows = []
-    for race, runners in races:
-        enriched = historical_context({**dict(race), "course": meeting["course"], "race_date": date}, enrich_race(runners))
-        race_assessments = []
-        for r in enriched:
-            assessment = selection_assessment(r)
-            components = assessment["components"]
-            race_assessments.append([
-                race["race_time"], race["race_name"], r.get("runner_name"),
-                r.get("screening_index"), r.get("screening_rank"),
-                assessment["candidate_score"], assessment["evidence_score"], assessment["evidence_coverage_pct"],
-                components.get("Cheltenham/course evidence"), components.get("Distance evidence"),
-                components.get("Going-family evidence"), components.get("Trainer record"),
-                components.get("Jockey record"), components.get("Recent-form proxy"),
-                r.get("course_runs", 0), r.get("course_wins", 0),
-                r.get("distance_runs", 0), r.get("distance_wins", 0),
-                r.get("going_runs", 0), r.get("going_wins", 0),
-                r.get("trainer_history_runs", 0), r.get("trainer_win_rate_pct"),
-                r.get("jockey_history_runs", 0), r.get("jockey_win_rate_pct"),
-                assessment["method"], r.get("history_sample_note", "")
-            ])
-        race_assessments.sort(key=lambda row: (row[5] is None, -(row[5] or 0), row[3] is None, -(row[3] or 0)))
-        assessment_rows.extend(race_assessments)
-    add_table_sheet(wb, "Selection Assessment", [
-        "Race Time", "Race", "Runner", "Screening Index", "Screening Rank",
-        "Candidate Score (heuristic)", "Evidence Score (%)", "Evidence Coverage (%)",
-        "Course Points (0-2)", "Distance Points (0-2)", "Going Points (0-2)",
-        "Trainer Points (0-2)", "Jockey Points (0-2)", "Recent Form Points (0-2)",
-        "Course Runs Stored", "Course Wins Stored", "Similar-Distance Runs", "Similar-Distance Wins",
-        "Going-Family Runs", "Going-Family Wins", "Trainer Runs Stored", "Trainer Win Rate % (local)",
-        "Jockey Runs Stored", "Jockey Win Rate % (local)", "Scoring Method", "Historical Data Note"
-    ], assessment_rows)
-
-    # Compact top-three shortlist, one row per selected runner per race.
-    shortlist_rows = []
-    for race, runners in races:
-        scored = []
-        for r in runners:
-            assessment = selection_assessment(r)
-            score = assessment.get("candidate_score")
-            if score is None:
-                score = as_float(r.get("screening_index"))
-            reasons, concerns = shortlist_reasons(r)
-            scored.append((r, assessment, score, reasons, concerns))
-        scored.sort(key=lambda item: (item[2] is None, -(item[2] or 0), item[0].get("runner_name", "").lower()))
-        ranked = [item for item in scored if item[2] is not None][:3]
-        if not ranked:
-            ranked = scored[:3]
-        for rank, (r, assessment, score, reasons, concerns) in enumerate(ranked, start=1):
-            shortlist_rows.append([
-                race.get("race_time"), race.get("race_name"), rank, r.get("runner_name"),
-                round(score, 1) if score is not None else None,
-                r.get("screening_index"), r.get("official_rating"), r.get("speed_figure"),
-                r.get("performance_rating"), r.get("recent_form"), reasons, concerns,
-                assessment.get("evidence_coverage_pct"), r.get("history_runs", 0),
-                r.get("course_runs", 0), r.get("distance_runs", 0), r.get("going_runs", 0),
-                "Heuristic shortlist; not a win probability"
-            ])
-    add_table_sheet(wb, "Selection Shortlist", [
-        "Race Time", "Race", "Shortlist Rank", "Horse", "Candidate Score (heuristic)",
-        "Screening Index", "Official Rating", "Sourced Speed Figure", "Sourced Performance Rating",
-        "Recent Form", "Why shortlisted", "Concerns / checks", "Historical Evidence Coverage %",
-        "Stored Horse Runs", "Course Runs Stored", "Similar-Distance Runs Stored", "Similar-Going Runs Stored",
-        "Interpretation"
-    ], shortlist_rows)
-
     history_rows = []
     for race, runners in races:
         if runners:
@@ -1012,11 +800,6 @@ def build_report(date, meeting_name):
         ["Pedigree", "Sire, dam and damsire are displayed when available; no unsupported suitability claim is inferred."],
         ["Not inferred from racecard alone", "Course/distance/going record, stamina, pace, jumping, fitness and trainer/jockey strike rates require historical datasets."],
         ["Speed modelling", "Do not estimate speed from racecard alone. Reliable time, distance, course and going data plus calibration are required."],
-        ["Selection Assessment sheet", "Separate heuristic assessment using course, similar-distance, going-family, trainer, jockey and recent-form evidence when available."],
-        ["Selection Shortlist sheet", "Shows up to three contenders per race, with plain-language supporting evidence and cautions. It is not a probability-of-winning model."],
-        ["Candidate Score", "When at least 3 of 6 evidence categories are available: 60% Screening Index + 40% evidence score. Otherwise the score falls back to Screening Index only."],
-        ["Evidence points", "Each available category is scored 0-2 using transparent rules; missing history is left blank and does not count against a runner."],
-        ["Historical archive limitation", "Course, distance, going, trainer and jockey stats only reflect results stored in this app; they are not complete external career records."],
         ["Validation", "Backtest with time-ordered historical data before relying on any ranking."],
         ["Data rights", "Confirm source licence covers storage, derived outputs, exports and any onward display."],
     ]
