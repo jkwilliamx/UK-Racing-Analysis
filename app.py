@@ -329,6 +329,35 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Import failed: {e}")
 
+    with st.expander("Import RacingFormBook historical archive", expanded=False):
+        st.caption("Upload the SFF ZIP files only: SFF_2016-2025.zip and SFF_2026.zip. Do not upload the Duo ZIPs as well, because they overlap with the same results.")
+        historical_zips = st.file_uploader(
+            "Select RacingFormBook SFF ZIP file(s)",
+            type=["zip"],
+            accept_multiple_files=True,
+            key="racingformbook_sff_uploads",
+        )
+        if historical_zips and st.button("Import historical archive", use_container_width=True):
+            total_races = total_rows = total_saved = total_bad = 0
+            progress = st.progress(0, text="Starting historical import...")
+            try:
+                for idx, uploaded_zip in enumerate(historical_zips):
+                    progress.progress(idx / len(historical_zips), text=f"Importing {uploaded_zip.name}...")
+                    races, rows, saved, bad = core.import_racingformbook_sff(uploaded_zip, uploaded_zip.name)
+                    total_races += races
+                    total_rows += rows
+                    total_saved += saved
+                    total_bad += bad
+                progress.progress(1.0, text="Historical import finished.")
+                st.success(
+                    f"Import complete: {total_races:,} races, {total_rows:,} runner rows processed, "
+                    f"{total_saved:,} runner records inserted/updated, {total_bad:,} rows skipped."
+                )
+                st.warning("This import is stored in the app's current database. Before relying on it long-term, we still need to configure persistent database storage so the archive survives app restarts or redeployments.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Historical archive import failed: {e}")
+
     st.divider()
     st.header("Demo / testing")
     st.caption("Use fictional horses to test the workflow.")
@@ -413,8 +442,9 @@ if meetings:
         selected_race_label = st.selectbox("Race", race_labels, key="analysis_race")
         selected_race_index = race_labels.index(selected_race_label)
         race_row, race_runners = race_pairs[selected_race_index]
-        analysis_rows = core.enrich_race(race_runners)
-        analysis_rows = core.historical_context({**dict(race_row), "course": meeting_row["course"], "race_date": analysis_date}, analysis_rows)
+        race_context = {**dict(race_row), "course": meeting_row["course"], "race_date": analysis_date}
+        analysis_rows = core.historical_context(race_context, race_runners)
+        analysis_rows = core.enrich_race(analysis_rows, race_context)
         if analysis_rows:
             display_rows = [{
                 "Rank": r.get("screening_rank"),
