@@ -5,6 +5,8 @@ import json
 import math
 import os
 import sqlite3
+import io
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -402,6 +404,143 @@ def store_historical_results(payload, source_url="https://api.theracingapi.com/v
                      nullable_str(_first_value(runner,"comments","comment",default="")),"The Racing API Basic horse results",stamp))
                 runner_count += 1
     return race_count, runner_count
+
+
+def import_racingformbook_sff(uploaded_file, source_name=None):
+    """Import RacingFormBook SFF CSV(s) from an uploaded ZIP into historical tables.
+
+    The import is idempotent: race IDs and normalised horse names prevent repeated
+    uploads from creating duplicate runner records. SP is retained as supplied by
+    the provider; it is not converted into a probability or used in the score yet.
+    """
+    init_db()
+    source_name = source_name or getattr(uploaded_file, "name", "RacingFormBook SFF archive")
+    stamp = now_utc()
+    race_count_seen = set()
+    runner_rows = 0
+    inserted_or_updated = 0
+    bad_rows = 0
+
+    # Accept Streamlit UploadedFile, bytes, or a seekable file-like object.
+    if isinstance(uploaded_file, (bytes, bytearray)):
+        uploaded_file = io.BytesIO(uploaded_file)
+    try:
+        uploaded_file.seek(0)
+    except Exception:
+        pass
+
+    with zipfile.ZipFile(uploaded_file) as archive, connect() as con:
+        csv_names = [n for n in archive.namelist() if n.lower().endswith('.csv') and not n.startswith('__MACOSX/')]
+        if not csv_names:
+            raise ValueError("No CSV files were found inside this ZIP archive.")
+        for csv_name in csv_names:
+            with archive.open(csv_name) as raw:
+                text = io.TextIOWrapper(raw, encoding='utf-8-sig', errors='replace', newline='')
+                reader = csv.DictReader(text)
+                required = {'Id', 'Course', 'RaceDate', 'HorseName', 'FPos'}
+                if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+                    raise ValueError(f"{csv_name} is not a recognised RacingFormBook SFF file.")
+                batch = []
+                for row in reader:
+                    raw_id = nullable_str(row.get('Id'))
+                    horse_name = nullable_str(row.get('HorseName'))
+                    course = nullable_str(row.get('Course')) or 'Unknown course'
+                    if not raw_id or not horse_name:
+                        bad_rows += 1
+                        continue
+                    try:
+                        race_date = datetime.strptime(str(row.get('RaceDate','')).strip(), '%d-%b-%y').date().isoformat()
+                    except ValueError:
+                        try:
+                            race_date = datetime.strptime(str(row.get('RaceDate','')).strip(), '%d-%b-%Y').date().isoformat()
+                        except ValueError:
+                            bad_rows += 1
+                            continue
+                    race_key = f"RFB:{raw_id}"
+                    horse_key = normalise_key(horse_name)
+                    if not horse_key:
+                        bad_rows += 1
+                        continue
+                    distance_yards = as_float(row.get('Yards'))
+                    distance_f = distance_yards / 220.0 if distance_yards is not None else None
+                    if distance_f is None:
+                        # Fallback for values like "2m 3f 66y".
+                        distance_f = None
+                    position_text = nullable_str(row.get('FPos'))
+                    try:
+                        position = int(float(position_text)) if position_text else None
+                    except (ValueError, TypeError):
+                        position = None
+                    status = None if position is not None else position_text
+                    weight_lbs = as_float(row.get('WeightLBS'))
+                    if weight_lbs is None:
+                        stone, lbs = as_float(row.get('Stone')), as_float(row.get('Lbs'))
+                        if stone is not None and lbs is not None:
+                            weight_lbs = stone * 14 + lbs
+                    race_meta = (
+                        race_key, race_date, course, 'GB/IRE', nullable_str(row.get('RaceTime')),
+                        nullable_str(row.get('Race')),
+                        nullable_str(row.get('Type')),
+                        distance_f, nullable_str(row.get('Going')),
+                        nullable_str(row.get('Class')),
+                        as_int(row.get('Ran')),
+                        'RacingFormBook SFF', f"{source_name}:{csv_name}", stamp
+                    )
+                    con.execute("""INSERT INTO historical_races
+                        (race_key,race_date,course,country,off_time,race_name,race_type,distance_f,going,race_class,field_size,source_name,source_url,captured_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(race_key) DO UPDATE SET
+                        race_date=excluded.race_date,course=excluded.course,off_time=excluded.off_time,
+                        race_name=excluded.race_name,race_type=excluded.race_type,
+                        distance_f=COALESCE(excluded.distance_f,historical_races.distance_f),
+                        going=COALESCE(excluded.going,historical_races.going),
+                        race_class=COALESCE(excluded.race_class,historical_races.race_class),
+                        field_size=COALESCE(excluded.field_size,historical_races.field_size),
+                        source_name=excluded.source_name,source_url=excluded.source_url,captured_at=excluded.captured_at""", race_meta)
+                    race_count_seen.add(race_key)
+                    batch.append((race_key, horse_key, None, horse_name, position, status,
+                        as_float(row.get('OR')), weight_lbs, nullable_str(row.get('Trainer')), None,
+                        nullable_str(row.get('Jockey')), None, nullable_str(row.get('Sp')),
+                        nullable_str(row.get('DstBtn')), nullable_str(row.get('Comments')),
+                        'RacingFormBook SFF', stamp))
+                    runner_rows += 1
+                    if len(batch) >= 5000:
+                        con.executemany("""INSERT INTO historical_runners
+                            (race_key,horse_key,horse_id,horse_name,finishing_position,result_status,official_rating,weight_lbs,trainer,trainer_id,jockey,jockey_id,starting_price,beaten_distance,comments,source_name,captured_at)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(race_key,horse_key) DO UPDATE SET
+                            horse_name=excluded.horse_name,
+                            finishing_position=COALESCE(excluded.finishing_position,historical_runners.finishing_position),
+                            result_status=COALESCE(excluded.result_status,historical_runners.result_status),
+                            official_rating=COALESCE(excluded.official_rating,historical_runners.official_rating),
+                            weight_lbs=COALESCE(excluded.weight_lbs,historical_runners.weight_lbs),
+                            trainer=COALESCE(excluded.trainer,historical_runners.trainer),
+                            jockey=COALESCE(excluded.jockey,historical_runners.jockey),
+                            starting_price=COALESCE(excluded.starting_price,historical_runners.starting_price),
+                            beaten_distance=COALESCE(excluded.beaten_distance,historical_runners.beaten_distance),
+                            comments=COALESCE(excluded.comments,historical_runners.comments),
+                            source_name=excluded.source_name,captured_at=excluded.captured_at""", batch)
+                        inserted_or_updated += len(batch)
+                        batch.clear()
+                if batch:
+                    con.executemany("""INSERT INTO historical_runners
+                        (race_key,horse_key,horse_id,horse_name,finishing_position,result_status,official_rating,weight_lbs,trainer,trainer_id,jockey,jockey_id,starting_price,beaten_distance,comments,source_name,captured_at)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(race_key,horse_key) DO UPDATE SET
+                        horse_name=excluded.horse_name,
+                        finishing_position=COALESCE(excluded.finishing_position,historical_runners.finishing_position),
+                        result_status=COALESCE(excluded.result_status,historical_runners.result_status),
+                        official_rating=COALESCE(excluded.official_rating,historical_runners.official_rating),
+                        weight_lbs=COALESCE(excluded.weight_lbs,historical_runners.weight_lbs),
+                        trainer=COALESCE(excluded.trainer,historical_runners.trainer),
+                        jockey=COALESCE(excluded.jockey,historical_runners.jockey),
+                        starting_price=COALESCE(excluded.starting_price,historical_runners.starting_price),
+                        beaten_distance=COALESCE(excluded.beaten_distance,historical_runners.beaten_distance),
+                        comments=COALESCE(excluded.comments,historical_runners.comments),
+                        source_name=excluded.source_name,captured_at=excluded.captured_at""", batch)
+                    inserted_or_updated += len(batch)
+                text.detach()
+    return len(race_count_seen), runner_rows, inserted_or_updated, bad_rows
 
 def _first_value(obj, *keys, default=None):
     for key in keys:
