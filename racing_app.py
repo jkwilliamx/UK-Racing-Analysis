@@ -81,7 +81,10 @@ class _PostgresConnection:
         return self.raw.execute(self._sql(sql), params or ())
 
     def executemany(self, sql, params):
-        return self.raw.executemany(self._sql(sql), params)
+        # psycopg 3 exposes executemany() on cursors, not connections.
+        cursor = self.raw.cursor()
+        cursor.executemany(self._sql(sql), params)
+        return cursor
 
     def executescript(self, script):
         for statement in script.split(';'):
@@ -1302,5 +1305,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
